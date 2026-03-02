@@ -1,0 +1,15 @@
+Django==5.0.4
+djangorestframework==3.15.1
+djangorestframework-simplejwt==5.3.1
+django-cors-headers==4.3.1
+gunicorn==23.0.0
+whitenoise==6.9.0
+psycopg2-binary>=2.9.9
+python-decouple==3.8
+reportlab==4.2.0; python_version < "3.13"
+reportlab>=4.2.5; python_version >= "3.13"
+Pillow==10.3.0; python_version < "3.13"
+Pillow>=11.0.0; python_version >= "3.13"
+django-filter==24.2
+drf-spectacular==0.27.2
+channels==4.1.0
