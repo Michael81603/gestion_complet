@@ -175,17 +175,9 @@ class UserViewSet(viewsets.ModelViewSet):
         return [IsAuthenticated(), IsAdmin()]
 
     def get_queryset(self):
-        qs = super().get_queryset()
-        scope_ids = get_admin_scope_ids(self.request.user)
-        if not scope_ids:
-            return qs
-        scoped_user_ids = set(
-            EntrepriseAccess.objects.filter(entreprise_id__in=scope_ids).values_list('user_id', flat=True)
-        )
-        scoped_user_ids.update(
-            Commande.objects.filter(entreprise_id__in=scope_ids, livreur__isnull=False).values_list('livreur_id', flat=True)
-        )
-        return qs.filter(Q(role='admin') | Q(id__in=scoped_user_ids)).distinct()
+        # The admin users page and order assignment need the full registered user list.
+        # Company scoping remains enforced on business datasets (commandes/transactions/dashboard).
+        return super().get_queryset()
 
     def get_serializer_class(self):
         if self.action == 'create':
