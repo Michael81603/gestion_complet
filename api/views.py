@@ -31,9 +31,24 @@ from .realtime import broadcast_event
 DASHBOARD_CACHE_TTL = 60
 
 
+def invalidate_dashboard_cache():
+    """Invalidate dashboard-related cache after writes."""
+    cache.clear()
+
+
+def is_global_admin(user):
+    """
+    Global admins are never constrained by EntrepriseAccess rows.
+    Staff/superusers keep full visibility by default.
+    """
+    return bool(user and user.is_authenticated and user.role == 'admin' and (user.is_staff or user.is_superuser))
+
+
 def get_admin_scope_ids(user):
     """Renvoie les entreprises accessibles pour un admin; liste vide = accès global."""
     if not user.is_authenticated or user.role != 'admin':
+        return []
+    if is_global_admin(user):
         return []
     return list(
         EntrepriseAccess.objects.filter(user=user).values_list('entreprise_id', flat=True)
@@ -181,6 +196,7 @@ class UserViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         user = serializer.save()
+        invalidate_dashboard_cache()
         log_action(self.request.user, 'CREATE_USER', 'user', user.id, {'nom': user.nom})
         broadcast_event(
             'user.created',
@@ -192,6 +208,7 @@ class UserViewSet(viewsets.ModelViewSet):
         user = self.get_object()
         user.actif = not user.actif
         user.save()
+        invalidate_dashboard_cache()
         log_action(request.user, 'TOGGLE_ACTIF', 'user', user.id)
         broadcast_event(
             'user.updated',
@@ -284,7 +301,10 @@ class EntrepriseViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         ent = serializer.save()
-        EntrepriseAccess.objects.get_or_create(user=self.request.user, entreprise=ent)
+        # Keep global admins global. Only scoped admins auto-gain access on newly created companies.
+        if get_admin_scope_ids(self.request.user):
+            EntrepriseAccess.objects.get_or_create(user=self.request.user, entreprise=ent)
+        invalidate_dashboard_cache()
         log_action(self.request.user, 'CREATE_ENTREPRISE', 'entreprise', ent.id, {'nom': ent.nom})
         broadcast_event(
             'entreprise.created',
@@ -296,6 +316,7 @@ class EntrepriseViewSet(viewsets.ModelViewSet):
         ent_id = instance.id
         log_action(self.request.user, 'DELETE_ENTREPRISE', 'entreprise', instance.id)
         instance.delete()
+        invalidate_dashboard_cache()
         broadcast_event(
             'entreprise.deleted',
             {'id': ent_id},
@@ -399,6 +420,7 @@ class CommandeViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         cmd = serializer.save()
+        invalidate_dashboard_cache()
         log_action(self.request.user, 'CREATE_COMMANDE', 'commande', cmd.id)
         broadcast_event(
             'commande.created',
@@ -414,6 +436,7 @@ class CommandeViewSet(viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         cmd = serializer.save()
+        invalidate_dashboard_cache()
         log_action(self.request.user, 'UPDATE_COMMANDE', 'commande', cmd.id)
         broadcast_event(
             'commande.updated',
@@ -428,6 +451,7 @@ class CommandeViewSet(viewsets.ModelViewSet):
         liv_id = instance.livreur_id
         log_action(self.request.user, 'DELETE_COMMANDE', 'commande', cmd_id)
         instance.delete()
+        invalidate_dashboard_cache()
         broadcast_event(
             'commande.deleted',
             {'id': cmd_id},
@@ -444,6 +468,7 @@ class CommandeViewSet(viewsets.ModelViewSet):
         cmd.statut = 'en cours'
         cmd.date_demarrage = timezone.now()
         cmd.save()
+        invalidate_dashboard_cache()
         log_action(request.user, 'DEMARRER_LIVRAISON', 'commande', cmd.id)
         broadcast_event(
             'commande.updated',
@@ -461,6 +486,7 @@ class CommandeViewSet(viewsets.ModelViewSet):
             return Response({'error': 'La commande doit être en cours.'}, status=400)
         cmd.statut = 'livrée'
         cmd.save()
+        invalidate_dashboard_cache()
         log_action(request.user, 'LIVRAISON_EFFECTUEE', 'commande', cmd.id)
         broadcast_event(
             'commande.updated',
@@ -478,6 +504,7 @@ class CommandeViewSet(viewsets.ModelViewSet):
             return Response({'error': 'La commande doit être livrée avant de recevoir le paiement.'}, status=400)
         cmd.statut = 'payée'
         cmd.save()  # Déclenche _create_transactions()
+        invalidate_dashboard_cache()
         log_action(request.user, 'PAIEMENT_RECU', 'commande', cmd.id, {'montant': str(cmd.prix)})
         broadcast_event(
             'commande.updated',
@@ -524,6 +551,7 @@ class TransactionViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         txn = serializer.save()
+        invalidate_dashboard_cache()
         log_action(self.request.user, 'CREATE_TRANSACTION', 'transaction', txn.id)
         broadcast_event(
             'transaction.created',
@@ -547,6 +575,7 @@ class TransactionViewSet(viewsets.ModelViewSet):
         serializer = TransactionCreateSerializer(data=payload)
         serializer.is_valid(raise_exception=True)
         txn = serializer.save()
+        invalidate_dashboard_cache()
         log_action(
             request.user,
             'CREATE_TRANSACTION',
@@ -608,11 +637,13 @@ class ObjectifViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         obj = serializer.save()
+        invalidate_dashboard_cache()
         log_action(self.request.user, 'CREATE_OBJECTIF', 'objectif', obj.id)
         broadcast_event('objectif.created', {'id': obj.id, 'type': obj.type, 'montant': float(obj.montant)})
 
     def perform_update(self, serializer):
         obj = serializer.save()
+        invalidate_dashboard_cache()
         log_action(self.request.user, 'UPDATE_OBJECTIF', 'objectif', obj.id)
         broadcast_event('objectif.updated', {'id': obj.id, 'type': obj.type, 'montant': float(obj.montant)})
 
@@ -620,6 +651,7 @@ class ObjectifViewSet(viewsets.ModelViewSet):
         obj_id = instance.id
         log_action(self.request.user, 'DELETE_OBJECTIF', 'objectif', obj_id)
         instance.delete()
+        invalidate_dashboard_cache()
         broadcast_event('objectif.deleted', {'id': obj_id})
 
 

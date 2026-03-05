@@ -56,6 +56,8 @@ class UserCreateSerializer(serializers.ModelSerializer):
         password = validated_data.pop('password')
         entreprise_ids = validated_data.pop('entreprise_ids', [])
         user = User(**validated_data)
+        if user.role == 'admin':
+            user.is_staff = True
         user.set_password(password)
         user.save()
         if entreprise_ids:
