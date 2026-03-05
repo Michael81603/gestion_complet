@@ -1,4 +1,5 @@
 from decimal import Decimal
+from unittest.mock import patch
 
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -163,3 +164,17 @@ class APIFeaturesTests(APITestCase):
         after = self.client.get('/api/dashboard/?periode=mois')
         self.assertEqual(after.status_code, status.HTTP_200_OK)
         self.assertEqual(Decimal(str(after.data['revenus_total'])), Decimal('120.00'))
+
+    @patch('api.realtime.get_channel_layer')
+    def test_create_entreprise_still_succeeds_if_realtime_broadcast_fails(self, mock_get_channel_layer):
+        class BrokenChannelLayer:
+            async def group_send(self, *args, **kwargs):
+                raise RuntimeError('channel layer unavailable')
+
+        mock_get_channel_layer.return_value = BrokenChannelLayer()
+
+        self._auth(self.admin)
+        response = self.client.post('/api/entreprises/', {'nom': 'Entreprise Sans WS'}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(Entreprise.objects.filter(nom='Entreprise Sans WS').exists())
