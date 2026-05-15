@@ -3,7 +3,8 @@ DeliverPro — Serializers DRF
 """
 from rest_framework import serializers
 from django.contrib.auth import authenticate
-from .models import User, Entreprise, EntrepriseAccess, Commande, Transaction, Objectif, AuditLog
+from .budget import get_objectif_progression
+from .models import User, Entreprise, EntrepriseAccess, Transaction, Objectif, AuditLog
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -31,7 +32,6 @@ class UserSerializer(serializers.ModelSerializer):
         model  = User
         fields = [
             'id', 'nom', 'email', 'role', 'telephone', 'actif',
-            'last_latitude', 'last_longitude', 'last_location_at',
             'entreprise_ids', 'created_at',
         ]
         read_only_fields = ['id', 'created_at']
@@ -57,7 +57,7 @@ class UserCreateSerializer(serializers.ModelSerializer):
         entreprise_ids = validated_data.pop('entreprise_ids', [])
         user = User(**validated_data)
         if user.role == 'admin':
-            user.is_staff = True
+            user.is_staff = not bool(entreprise_ids)
         user.set_password(password)
         user.save()
         if entreprise_ids:
@@ -136,61 +136,6 @@ class EntrepriseListSerializer(serializers.ModelSerializer):
         fields = ['id', 'nom', 'adresse', 'telephone']
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# COMMANDE SERIALIZERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-class CommandeSerializer(serializers.ModelSerializer):
-    entreprise_nom = serializers.CharField(source='entreprise.nom', read_only=True)
-    livreur_nom    = serializers.CharField(source='livreur.nom',    read_only=True)
-
-    class Meta:
-        model  = Commande
-        fields = [
-            'id', 'entreprise', 'entreprise_nom',
-            'livreur', 'livreur_nom',
-            'client_nom', 'adresse', 'latitude', 'longitude', 'telephone',
-            'prix', 'cout_livraison', 'depense',
-            'statut', 'date', 'date_demarrage', 'date_livraison', 'date_paiement',
-            'notes', 'created_at', 'updated_at',
-        ]
-        read_only_fields = ['id', 'date_demarrage', 'date_livraison', 'date_paiement', 'created_at', 'updated_at']
-
-    def validate(self, data):
-        statut = data.get('statut', getattr(self.instance, 'statut', 'en attente'))
-        latitude = data.get('latitude')
-        longitude = data.get('longitude')
-        if latitude is not None and (latitude < -90 or latitude > 90):
-            raise serializers.ValidationError("La latitude doit être comprise entre -90 et 90.")
-        if longitude is not None and (longitude < -180 or longitude > 180):
-            raise serializers.ValidationError("La longitude doit être comprise entre -180 et 180.")
-        # Règle: ne peut être payée que si livrée
-        if statut == 'payée':
-            instance_statut = getattr(self.instance, 'statut', 'en attente')
-            if instance_statut not in ('livrée', 'payée') and data.get('statut') == 'payée':
-                raise serializers.ValidationError(
-                    "Une commande doit être livrée avant d'être marquée comme payée."
-                )
-        return data
-
-
-class CommandeCreateSerializer(serializers.ModelSerializer):
-    class Meta:
-        model  = Commande
-        fields = [
-            'entreprise', 'livreur', 'client_nom', 'adresse', 'latitude', 'longitude',
-            'telephone', 'prix', 'cout_livraison', 'depense',
-            'statut', 'date', 'notes',
-        ]
-
-    def validate(self, attrs):
-        latitude = attrs.get('latitude')
-        longitude = attrs.get('longitude')
-        if latitude is not None and (latitude < -90 or latitude > 90):
-            raise serializers.ValidationError("La latitude doit être comprise entre -90 et 90.")
-        if longitude is not None and (longitude < -180 or longitude > 180):
-            raise serializers.ValidationError("La longitude doit être comprise entre -180 et 180.")
-        return attrs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -204,17 +149,17 @@ class TransactionSerializer(serializers.ModelSerializer):
     class Meta:
         model  = Transaction
         fields = [
-            'id', 'type', 'montant', 'label',
-            'commande', 'entreprise', 'entreprise_nom',
-            'user', 'user_nom', 'date', 'created_at',
+            'id', 'type', 'categorie', 'montant', 'label', 'description',
+            'entreprise', 'entreprise_nom',
+            'user', 'user_nom', 'date', 'created_at', 'updated_at',
         ]
-        read_only_fields = ['id', 'created_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
 
 
 class TransactionCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model  = Transaction
-        fields = ['type', 'montant', 'label', 'commande', 'entreprise', 'user', 'date']
+        fields = ['type', 'categorie', 'montant', 'label', 'description', 'entreprise', 'user', 'date']
 
     def validate_montant(self, value):
         if value <= 0:
@@ -228,30 +173,50 @@ class TransactionCreateSerializer(serializers.ModelSerializer):
 
 class ObjectifSerializer(serializers.ModelSerializer):
     progression = serializers.SerializerMethodField(read_only=True)
+    entreprise_nom = serializers.CharField(source='entreprise.nom', read_only=True)
 
     class Meta:
         model  = Objectif
-        fields = ['id', 'type', 'montant', 'periode', 'label', 'mois', 'annee', 'created_at', 'progression']
+        fields = [
+            'id', 'type', 'categorie', 'entreprise', 'entreprise_nom', 'montant', 'periode', 'label',
+            'date_debut', 'date_fin', 'mois', 'annee',
+            'seuil_alerte', 'notification_email', 'created_at', 'progression',
+        ]
         read_only_fields = ['id', 'created_at']
 
-    def get_progression(self, obj):
-        from django.db.models import Sum
-        qs = Transaction.objects.all()
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        date_debut = attrs.get('date_debut', getattr(self.instance, 'date_debut', None))
+        date_fin = attrs.get('date_fin', getattr(self.instance, 'date_fin', None))
+
+        if date_debut or date_fin:
+            if not date_debut or not date_fin:
+                raise serializers.ValidationError("La date de debut et la date de fin sont obligatoires ensemble.")
+            if date_fin < date_debut:
+                raise serializers.ValidationError("La date de fin doit etre apres la date de debut.")
+            attrs['periode'] = 'personnalise'
+
+        obj_type = attrs.get('type', getattr(self.instance, 'type', None))
+        if obj_type != 'depense':
+            attrs['categorie'] = None
+        if obj_type != 'revenu':
+            attrs['entreprise'] = None
+
+        entreprise = attrs.get('entreprise', getattr(self.instance, 'entreprise', None))
         entreprise_ids = self.context.get('entreprise_ids')
-        if entreprise_ids:
-            qs = qs.filter(entreprise_id__in=entreprise_ids)
-        if obj.mois:
-            qs = qs.filter(date__month=obj.mois)
-        if obj.annee:
-            qs = qs.filter(date__year=obj.annee)
-        total = qs.filter(type=obj.type).aggregate(t=Sum('montant'))['t'] or 0
-        pct = float(total / obj.montant * 100) if obj.montant else 0
-        return {
-            'total':      float(total),
-            'objectif':   float(obj.montant),
-            'pourcentage': round(pct, 1),
-            'depasse':    total > obj.montant,
-        }
+        if entreprise and entreprise_ids is not None and entreprise.id not in entreprise_ids:
+            raise serializers.ValidationError("Entreprise hors perimetre autorise.")
+
+        return attrs
+
+    def validate_seuil_alerte(self, value):
+        if value < 1 or value > 100:
+            raise serializers.ValidationError("Le seuil d'alerte doit etre entre 1 et 100.")
+        return value
+
+    def get_progression(self, obj):
+        entreprise_ids = self.context.get('entreprise_ids')
+        return get_objectif_progression(obj, entreprise_ids=entreprise_ids)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -262,11 +227,6 @@ class DashboardSerializer(serializers.Serializer):
     revenus_total      = serializers.DecimalField(max_digits=12, decimal_places=2)
     depenses_total     = serializers.DecimalField(max_digits=12, decimal_places=2)
     benefice_net       = serializers.DecimalField(max_digits=12, decimal_places=2)
-    nb_commandes       = serializers.IntegerField()
-    nb_en_attente      = serializers.IntegerField()
-    nb_en_cours        = serializers.IntegerField()
-    nb_livrees         = serializers.IntegerField()
-    nb_payees          = serializers.IntegerField()
     revenus_par_jour   = serializers.ListField()
     depenses_par_jour  = serializers.ListField()
 

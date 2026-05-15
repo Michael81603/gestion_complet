@@ -12,8 +12,6 @@ class UpdatesConsumer(AsyncJsonWebsocketConsumer):
             return
 
         self._groups = ['updates_all', f'updates_user_{user.id}']
-        if user.role == 'livreur':
-            self._groups.append(f'updates_livreur_{user.id}')
         if user.role == 'admin':
             ent_ids = await self._get_scope_ids(user.id)
             for ent_id in ent_ids:

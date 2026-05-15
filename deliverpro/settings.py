@@ -80,9 +80,17 @@ TEMPLATES = [
 WSGI_APPLICATION = 'deliverpro.wsgi.application'
 ASGI_APPLICATION = 'deliverpro.asgi.application'
 
+USE_SQLITE = get_env_bool('USE_SQLITE', default=False)
 DATABASE_URL = config('DATABASE_URL', default='').strip()
 
-if DATABASE_URL:
+if USE_SQLITE:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
+elif DATABASE_URL:
     parsed_database_url = urlparse(DATABASE_URL)
     query_params = parse_qs(parsed_database_url.query)
 
@@ -158,11 +166,24 @@ CACHES = {
 }
 
 # ─── Channels (WebSocket temps réel) ─────────────────────────────────────────
-CHANNEL_LAYERS = {
-    'default': {
-        'BACKEND': 'channels.layers.InMemoryChannelLayer',
-    },
-}
+REDIS_URL = config('REDIS_URL', default='').strip()
+
+if REDIS_URL:
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels_redis.core.RedisChannelLayer',
+            'CONFIG': {
+                'hosts': [REDIS_URL],
+            },
+        },
+    }
+else:
+    # Local/dev fallback only. In production, use REDIS_URL for cross-process events.
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels.layers.InMemoryChannelLayer',
+        },
+    }
 
 # ─── REST Framework ───────────────────────────────────────────────────────────
 REST_FRAMEWORK = {
@@ -199,6 +220,23 @@ CORS_ALLOWED_ORIGINS = get_env_list(
 CORS_ALLOW_CREDENTIALS = True
 CSRF_TRUSTED_ORIGINS = get_env_list('CSRF_TRUSTED_ORIGINS')
 
+# ─── Email / notifications ───────────────────────────────────────────────────
+EMAIL_BACKEND = config(
+    'EMAIL_BACKEND',
+    default='django.core.mail.backends.console.EmailBackend' if DEBUG else 'django.core.mail.backends.smtp.EmailBackend'
+)
+EMAIL_HOST = config('EMAIL_HOST', default='')
+EMAIL_PORT = config('EMAIL_PORT', default=587, cast=int)
+EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')
+EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
+EMAIL_USE_TLS = get_env_bool('EMAIL_USE_TLS', default=True)
+EMAIL_USE_SSL = get_env_bool('EMAIL_USE_SSL', default=False)
+DEFAULT_FROM_EMAIL = config(
+    'DEFAULT_FROM_EMAIL',
+    default=EMAIL_HOST_USER or 'DeliverPro Finance <noreply@deliverpro.local>'
+)
+SERVER_EMAIL = DEFAULT_FROM_EMAIL
+
 # Production security for Render (traffic is proxied over HTTPS)
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 USE_X_FORWARDED_HOST = True
@@ -214,7 +252,7 @@ if not DEBUG:
 # ─── DRF Spectacular (Swagger) ────────────────────────────────────────────────
 SPECTACULAR_SETTINGS = {
     'TITLE': 'DeliverPro API',
-    'DESCRIPTION': 'API de gestion de livraison et finance',
+    'DESCRIPTION': 'API de gestion financiere',
     'VERSION': '1.0.0',
     'SERVE_INCLUDE_SCHEMA': False,
 }

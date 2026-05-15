@@ -30,18 +30,14 @@ class UserManager(BaseUserManager):
 class User(AbstractBaseUser, PermissionsMixin):
     ROLE_CHOICES = [
         ('admin', 'Administrateur'),
-        ('livreur', 'Livreur'),
     ]
 
     nom        = models.CharField(max_length=150, verbose_name="Nom complet")
     email      = models.EmailField(unique=True, verbose_name="Email")
-    role       = models.CharField(max_length=20, choices=ROLE_CHOICES, default='livreur')
+    role       = models.CharField(max_length=20, choices=ROLE_CHOICES, default='admin')
     telephone  = models.CharField(max_length=20, blank=True, null=True)
     actif      = models.BooleanField(default=True)
-    last_latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
-    last_longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
-    last_location_at = models.DateTimeField(null=True, blank=True)
-    is_staff   = models.BooleanField(default=False)
+    is_staff   = models.BooleanField(default=True)
     is_active  = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -57,15 +53,11 @@ class User(AbstractBaseUser, PermissionsMixin):
         ordering = ['-created_at']
 
     def __str__(self):
-        return f"{self.nom} ({self.role})"
+        return f"{self.nom} ({self.email})"
 
     @property
     def is_admin(self):
         return self.role == 'admin'
-
-    @property
-    def is_livreur(self):
-        return self.role == 'livreur'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -76,7 +68,7 @@ class Entreprise(models.Model):
     nom            = models.CharField(max_length=200, verbose_name="Nom")
     adresse        = models.TextField(blank=True, null=True, verbose_name="Adresse")
     telephone      = models.CharField(max_length=20, blank=True, null=True)
-    date_creation  = models.DateField(default=timezone.now)
+    date_creation  = models.DateField(default=timezone.localdate)
     created_at     = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -88,7 +80,7 @@ class Entreprise(models.Model):
         return self.nom
 
     def get_stats(self):
-        from django.db.models import Sum, Count
+        from django.db.models import Sum
         from decimal import Decimal
         txns = self.transactions.all()
         revenus  = txns.filter(type='revenu').aggregate(t=Sum('montant'))['t'] or Decimal('0')
@@ -97,7 +89,6 @@ class Entreprise(models.Model):
             'revenus':   revenus,
             'depenses':  depenses,
             'benefice':  revenus - depenses,
-            'nb_commandes': self.commandes.count(),
         }
 
 
@@ -121,95 +112,6 @@ class EntrepriseAccess(models.Model):
         return f"{self.user.nom} -> {self.entreprise.nom}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# COMMANDE MODEL
-# ─────────────────────────────────────────────────────────────────────────────
-
-class Commande(models.Model):
-    STATUT_CHOICES = [
-        ('en attente', 'En attente'),
-        ('en cours',   'En cours'),
-        ('livrée',     'Livrée'),
-        ('payée',      'Payée'),
-    ]
-
-    entreprise      = models.ForeignKey(Entreprise, on_delete=models.PROTECT, related_name='commandes')
-    livreur         = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='commandes', limit_choices_to={'role': 'livreur'})
-    client_nom      = models.CharField(max_length=200, verbose_name="Nom client")
-    adresse         = models.TextField(verbose_name="Adresse de livraison")
-    latitude        = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
-    longitude       = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
-    telephone       = models.CharField(max_length=20, blank=True, null=True)
-    prix            = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    cout_livraison  = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    depense         = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    statut          = models.CharField(max_length=20, choices=STATUT_CHOICES, default='en attente')
-    date            = models.DateField(default=timezone.now)
-    date_livraison  = models.DateTimeField(null=True, blank=True)
-    date_paiement   = models.DateTimeField(null=True, blank=True)
-    date_demarrage  = models.DateTimeField(null=True, blank=True)
-    notes           = models.TextField(blank=True, null=True)
-    created_at      = models.DateTimeField(auto_now_add=True)
-    updated_at      = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        verbose_name = "Commande"
-        verbose_name_plural = "Commandes"
-        ordering = ['-created_at']
-        indexes = [
-            models.Index(fields=['statut']),
-            models.Index(fields=['date']),
-            models.Index(fields=['livreur']),
-            models.Index(fields=['entreprise']),
-        ]
-
-    def __str__(self):
-        return f"Commande #{self.id} — {self.client_nom}"
-
-    def save(self, *args, **kwargs):
-        # Auto-set date_demarrage
-        if self.statut == 'en cours' and not self.date_demarrage:
-            self.date_demarrage = timezone.now()
-        # Auto-set date_livraison
-        if self.statut in ('livrée', 'payée') and not self.date_livraison:
-            self.date_livraison = timezone.now()
-        # Auto-set date_paiement and create transactions
-        if self.statut == 'payée' and not self.date_paiement:
-            self.date_paiement = timezone.now()
-            super().save(*args, **kwargs)
-            self._create_transactions()
-            return
-        super().save(*args, **kwargs)
-
-    def _create_transactions(self):
-        """Crée automatiquement les transactions revenu/dépense."""
-        today = timezone.now().date()
-        # Revenu
-        Transaction.objects.get_or_create(
-            commande=self,
-            type='revenu',
-            defaults={
-                'montant':      self.prix,
-                'label':        f'Paiement commande #{self.id} — {self.client_nom}',
-                'entreprise':   self.entreprise,
-                'user':         self.livreur,
-                'date':         today,
-            }
-        )
-        # Dépense livraison
-        total_dep = self.cout_livraison + self.depense
-        if total_dep > 0:
-            Transaction.objects.get_or_create(
-                commande=self,
-                type='depense',
-                defaults={
-                    'montant':    total_dep,
-                    'label':      f'Coût livraison + dépense #{self.id}',
-                    'entreprise': self.entreprise,
-                    'user':       self.livreur,
-                    'date':       today,
-                }
-            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -221,15 +123,29 @@ class Transaction(models.Model):
         ('revenu',  'Revenu'),
         ('depense', 'Dépense'),
     ]
+    CATEGORIE_CHOICES = [
+        ('vente', 'Vente'),
+        ('prestation', 'Prestation'),
+        ('salaire', 'Salaire'),
+        ('loyer', 'Loyer'),
+        ('fournitures', 'Fournitures'),
+        ('transport', 'Transport'),
+        ('utilitaires', 'Utilitaires'),
+        ('maintenance', 'Maintenance'),
+        ('marketing', 'Marketing'),
+        ('autre', 'Autre'),
+    ]
 
     type         = models.CharField(max_length=10, choices=TYPE_CHOICES)
+    categorie    = models.CharField(max_length=20, choices=CATEGORIE_CHOICES, default='autre')
     montant      = models.DecimalField(max_digits=10, decimal_places=2)
     label        = models.CharField(max_length=300)
-    commande     = models.ForeignKey(Commande, on_delete=models.SET_NULL, null=True, blank=True, related_name='transactions')
-    entreprise   = models.ForeignKey(Entreprise, on_delete=models.SET_NULL, null=True, blank=True, related_name='transactions')
+    entreprise   = models.ForeignKey(Entreprise, on_delete=models.PROTECT, related_name='transactions')
     user         = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='transactions')
-    date         = models.DateField(default=timezone.now)
+    date         = models.DateField(default=timezone.localdate)
+    description  = models.TextField(blank=True, null=True)
     created_at   = models.DateTimeField(auto_now_add=True)
+    updated_at   = models.DateTimeField(auto_now=True)
 
     class Meta:
         verbose_name = "Transaction"
@@ -239,6 +155,7 @@ class Transaction(models.Model):
             models.Index(fields=['type']),
             models.Index(fields=['date']),
             models.Index(fields=['entreprise']),
+            models.Index(fields=['categorie']),
         ]
 
     def __str__(self):
@@ -258,14 +175,34 @@ class Objectif(models.Model):
         ('hebdomadaire', 'Hebdomadaire'),
         ('mensuel',      'Mensuel'),
         ('annuel',       'Annuel'),
+        ('personnalise', 'Personnalisé'),
     ]
 
     type      = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    categorie = models.CharField(
+        max_length=20,
+        choices=Transaction.CATEGORIE_CHOICES,
+        blank=True,
+        null=True,
+        verbose_name="Catégorie de dépense",
+    )
+    entreprise = models.ForeignKey(
+        Entreprise,
+        on_delete=models.PROTECT,
+        related_name='objectifs',
+        blank=True,
+        null=True,
+        verbose_name="Entreprise ciblée",
+    )
     montant   = models.DecimalField(max_digits=10, decimal_places=2)
     periode   = models.CharField(max_length=20, choices=PERIODE_CHOICES, default='mensuel')
     label     = models.CharField(max_length=200, blank=True)
+    date_debut = models.DateField(null=True, blank=True)
+    date_fin   = models.DateField(null=True, blank=True)
     mois      = models.IntegerField(null=True, blank=True)
     annee     = models.IntegerField(null=True, blank=True)
+    seuil_alerte = models.PositiveSmallIntegerField(default=80)
+    notification_email = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -274,6 +211,31 @@ class Objectif(models.Model):
 
     def __str__(self):
         return f"{self.label or self.type} — {self.montant}€"
+
+
+class BudgetNotification(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='budget_notifications')
+    objectif = models.ForeignKey(Objectif, on_delete=models.CASCADE, related_name='notifications')
+    niveau = models.CharField(max_length=30)
+    periode_cle = models.CharField(max_length=80)
+    email_to = models.EmailField()
+    total = models.DecimalField(max_digits=12, decimal_places=2)
+    montant_objectif = models.DecimalField(max_digits=12, decimal_places=2)
+    sent_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Notification budget"
+        verbose_name_plural = "Notifications budget"
+        ordering = ['-sent_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['user', 'objectif', 'niveau', 'periode_cle'],
+                name='uniq_budget_notification_period',
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.email_to} — {self.objectif} — {self.niveau}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -13,7 +13,7 @@
 ### 1️⃣ Cloner et configurer l'environnement
 
 ```bash
-cd deliverpro_backend
+cd gestion_complet
 python -m venv venv
 
 # Windows
@@ -60,8 +60,12 @@ DB_USER=deliverpro_user
 DB_PASSWORD=VotreMotDePasse123!
 DB_HOST=localhost
 DB_PORT=5432
-CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:5500
+USE_SQLITE=False
+CORS_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:5500
+CSRF_TRUSTED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:5500
 ```
+
+Pour un lancement local rapide sans PostgreSQL, utilisez `USE_SQLITE=True`.
 
 ### 4️⃣ Migrations et données de démo
 
@@ -98,7 +102,7 @@ L'API est disponible sur **http://localhost:8000**
 ```json
 POST /api/auth/login/
 {
-  "email": "admin@deliverpro.com",
+  "email": "rakezyadiams@gmail.com",
   "password": "Admin123!"
 }
 ```
@@ -198,6 +202,12 @@ Ajouter le header sur toutes les requêtes :
 Authorization: Bearer <access_token>
 ```
 
+## 🔎 Règle d'accès admin
+
+- Un admin `is_staff` ou `is_superuser` est global.
+- Un admin non staff est limité aux entreprises listées dans `EntrepriseAccess`.
+- Un admin non staff sans accès explicite ne voit aucune donnée métier.
+
 ---
 
 ## 📖 Documentation Swagger
@@ -235,18 +245,36 @@ deliverpro_backend/
 
 ## 🚀 Déploiement Production
 
-```bash
-# Variables d'environnement
+Le projet contient déjà un `render.yaml` prêt pour un déploiement Render en ASGI.
+
+Variables obligatoires à renseigner en production :
+
+```env
 DEBUG=False
 SECRET_KEY=cle-aleatoire-longue-64-chars
-
-# Collecte des fichiers statiques
-python manage.py collectstatic
-
-# Gunicorn
-pip install gunicorn
-gunicorn deliverpro.wsgi:application --bind 0.0.0.0:8000 --workers 4
+DATABASE_URL=postgresql://...
+REDIS_URL=redis://...
+ALLOWED_HOSTS=.onrender.com,votre-domaine-api.com
+CORS_ALLOWED_ORIGINS=https://votre-front.com
+CSRF_TRUSTED_ORIGINS=https://votre-api.onrender.com,https://votre-front.com
+SECURE_SSL_REDIRECT=True
 ```
+
+Commandes utilisées par Render :
+
+```bash
+# build
+pip install -r requirements.txt
+python manage.py collectstatic --noinput
+
+# avant déploiement
+python manage.py migrate --noinput
+
+# serveur HTTP + WebSocket
+uvicorn deliverpro.asgi:application --host 0.0.0.0 --port $PORT
+```
+
+`REDIS_URL` est recommandé en production pour que les notifications temps réel fonctionnent entre plusieurs processus ou instances. Sans `REDIS_URL`, le projet garde une couche mémoire locale utile seulement pour le développement.
 
 ---
 
@@ -254,7 +282,7 @@ gunicorn deliverpro.wsgi:application --bind 0.0.0.0:8000 --workers 4
 
 | Rôle | Email | Mot de passe |
 |------|-------|--------------|
-| Admin | admin@deliverpro.com | Admin123! |
+| Admin | rakezyadiams@gmail.com | Admin123! |
 | Livreur 1 | jean@deliverpro.com | Livr123! |
 | Livreur 2 | marie@deliverpro.com | Livr123! |
 ---

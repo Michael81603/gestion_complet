@@ -4,23 +4,25 @@ DeliverPro — Vues API (ViewSets + APIViews)
 from datetime import date, timedelta
 from decimal import Decimal
 
-from django.db.models import Sum, Count, Q
-from django.db.models.functions import TruncDate
+from django.conf import settings
+from django.db.models import Sum, Count, Q, ProtectedError
 from django.core.cache import cache
+from django.core.mail import send_mail
 from django.utils import timezone
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import User, Entreprise, EntrepriseAccess, Commande, Transaction, Objectif, AuditLog
-from .permissions import IsAdmin, IsLivreur, IsOwnerOrAdmin, IsAdminOrLivreur
+from .budget import get_objectif_period_key, get_objectif_progression
+from .models import User, Entreprise, EntrepriseAccess, Transaction, Objectif, AuditLog, BudgetNotification
+from .permissions import IsAdmin
 from .serializers import (
     LoginSerializer, UserSerializer, UserCreateSerializer, UserUpdateSerializer,
     ChangePasswordSerializer, EntrepriseSerializer, EntrepriseListSerializer,
-    CommandeSerializer, CommandeCreateSerializer,
     TransactionSerializer, TransactionCreateSerializer,
     ObjectifSerializer, AuditLogSerializer,
 )
@@ -29,11 +31,17 @@ from .realtime import broadcast_event
 
 
 DASHBOARD_CACHE_TTL = 60
+DASHBOARD_CACHE_VERSION_KEY = 'dashboard_cache_version'
+
+
+def get_dashboard_cache_version():
+    return cache.get(DASHBOARD_CACHE_VERSION_KEY, 1)
 
 
 def invalidate_dashboard_cache():
-    """Invalidate dashboard-related cache after writes."""
-    cache.clear()
+    """Invalidate dashboard cache without flushing unrelated cache entries."""
+    current_version = get_dashboard_cache_version()
+    cache.set(DASHBOARD_CACHE_VERSION_KEY, current_version + 1, timeout=None)
 
 
 def is_global_admin(user):
@@ -45,11 +53,11 @@ def is_global_admin(user):
 
 
 def get_admin_scope_ids(user):
-    """Renvoie les entreprises accessibles pour un admin; liste vide = accès global."""
+    """Renvoie les entreprises accessibles; None = accès global, [] = aucun accès."""
     if not user.is_authenticated or user.role != 'admin':
         return []
     if is_global_admin(user):
-        return []
+        return None
     return list(
         EntrepriseAccess.objects.filter(user=user).values_list('entreprise_id', flat=True)
     )
@@ -57,9 +65,11 @@ def get_admin_scope_ids(user):
 
 def apply_admin_scope(qs, user, field='entreprise_id'):
     scope_ids = get_admin_scope_ids(user)
-    if scope_ids:
-        return qs.filter(**{f'{field}__in': scope_ids})
-    return qs
+    if scope_ids is None:
+        return qs
+    if not scope_ids:
+        return qs.none()
+    return qs.filter(**{f'{field}__in': scope_ids})
 
 
 def get_period_start(periode, today):
@@ -76,25 +86,98 @@ def compute_budget_alerts(user, seuil=80):
     objectifs = Objectif.objects.all()
     alerts = []
     for obj in objectifs:
-        progression = ObjectifSerializer(
-            obj, context={'entreprise_ids': get_admin_scope_ids(user)}
-        ).data['progression']
+        progression = get_objectif_progression(obj, entreprise_ids=get_admin_scope_ids(user))
         pct = progression['pourcentage']
-        if progression['depasse']:
+        objectif_seuil = obj.seuil_alerte or seuil
+        if obj.type == 'depense' and progression['statut'] == 'depassement':
             alerts.append({
                 'objectif_id': obj.id,
                 'label': obj.label or obj.type,
+                'categorie': obj.categorie or '',
                 'niveau': 'depassement',
                 'pourcentage': pct,
+                'total': progression['total'],
+                'objectif': progression['objectif'],
+                'periode_debut': progression['periode_debut'],
+                'periode_fin': progression['periode_fin'],
             })
-        elif pct >= seuil:
+        elif pct >= objectif_seuil:
             alerts.append({
                 'objectif_id': obj.id,
                 'label': obj.label or obj.type,
-                'niveau': 'proche_limite',
+                'categorie': obj.categorie or '',
+                'niveau': 'proche_limite' if obj.type == 'depense' else 'proche_objectif',
                 'pourcentage': pct,
+                'total': progression['total'],
+                'objectif': progression['objectif'],
+                'periode_debut': progression['periode_debut'],
+                'periode_fin': progression['periode_fin'],
             })
     return alerts
+
+
+def _budget_recipients_for_transaction(txn):
+    admins = User.objects.filter(role='admin', actif=True, is_active=True).exclude(email='')
+    for admin in admins:
+        scope_ids = get_admin_scope_ids(admin)
+        if scope_ids is None or txn.entreprise_id in scope_ids:
+            yield admin, scope_ids
+
+
+def notify_budget_exceeded(txn):
+    if txn.type != 'depense':
+        return
+
+    objectifs = Objectif.objects.filter(type='depense', notification_email=True)
+    for admin, scope_ids in _budget_recipients_for_transaction(txn):
+        for obj in objectifs:
+            if obj.categorie and obj.categorie != txn.categorie:
+                continue
+            progression = get_objectif_progression(obj, entreprise_ids=scope_ids)
+            if progression['statut'] != 'depassement':
+                continue
+
+            periode_cle = get_objectif_period_key(obj)
+            already_sent = BudgetNotification.objects.filter(
+                user=admin,
+                objectif=obj,
+                niveau='depassement',
+                periode_cle=periode_cle,
+            ).exists()
+            if already_sent:
+                continue
+
+            subject = f"Alerte budget depasse - {obj.label or 'Budget depenses'}"
+            message = (
+                f"Bonjour {admin.nom},\n\n"
+                f"Le budget \"{obj.label or obj.type}\" est depasse.\n"
+                f"Budget prevu : {progression['objectif']:.2f} MGA\n"
+                f"Depenses actuelles : {progression['total']:.2f} MGA\n"
+                f"Periode : {progression['periode_debut']} au {progression['periode_fin']}\n"
+                f"Derniere depense : {txn.label} ({txn.montant} MGA)\n\n"
+                "Connectez-vous au dashboard DeliverPro Finance pour verifier les details."
+            )
+
+            try:
+                send_mail(
+                    subject,
+                    message,
+                    settings.DEFAULT_FROM_EMAIL,
+                    [admin.email],
+                    fail_silently=False,
+                )
+                BudgetNotification.objects.create(
+                    user=admin,
+                    objectif=obj,
+                    niveau='depassement',
+                    periode_cle=periode_cle,
+                    email_to=admin.email,
+                    total=Decimal(str(progression['total'])),
+                    montant_objectif=Decimal(str(progression['objectif'])),
+                )
+                log_action(admin, 'BUDGET_EMAIL_SENT', 'objectif', obj.id, {'email': admin.email})
+            except Exception as exc:
+                log_action(admin, 'BUDGET_EMAIL_FAILED', 'objectif', obj.id, {'error': str(exc), 'email': admin.email})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,14 +252,8 @@ class UserViewSet(viewsets.ModelViewSet):
     filterset_fields = ['role', 'actif']
     search_fields = ['nom', 'email']
 
-    def get_permissions(self):
-        if self.action == 'update_location':
-            return [IsAuthenticated(), IsLivreur()]
-        return [IsAuthenticated(), IsAdmin()]
-
     def get_queryset(self):
-        # The admin users page and order assignment need the full registered user list.
-        # Company scoping remains enforced on business datasets (commandes/transactions/dashboard).
+        # Company scoping remains enforced on business datasets.
         return super().get_queryset()
 
     def get_serializer_class(self):
@@ -208,70 +285,19 @@ class UserViewSet(viewsets.ModelViewSet):
         )
         return Response({'actif': user.actif})
 
-    @action(detail=True, methods=['get'])
-    def stats(self, request, pk=None):
-        user = self.get_object()
-        cmds = apply_admin_scope(Commande.objects.filter(livreur=user), request.user)
-        total_paiements = Transaction.objects.filter(
-            type='revenu',
-            commande__in=cmds
-        ).aggregate(t=Sum('montant'))['t'] or Decimal('0')
-        return Response({
-            'total_commandes':  cmds.count(),
-            'livrees':          cmds.filter(statut__in=['livrée', 'payée']).count(),
-            'en_cours':         cmds.filter(statut='en cours').count(),
-            'en_attente':       cmds.filter(statut='en attente').count(),
-            'total_paiements':  total_paiements,
-        })
-
     @action(detail=False, methods=['post'])
-    def update_location(self, request):
-        latitude = request.data.get('latitude')
-        longitude = request.data.get('longitude')
-        if latitude is None or longitude is None:
-            return Response({'error': 'latitude et longitude sont requis.'}, status=400)
-        try:
-            latitude = Decimal(str(latitude))
-            longitude = Decimal(str(longitude))
-        except Exception:
-            return Response({'error': 'latitude/longitude invalides.'}, status=400)
-        if latitude < Decimal('-90') or latitude > Decimal('90'):
-            return Response({'error': 'latitude hors plage.'}, status=400)
-        if longitude < Decimal('-180') or longitude > Decimal('180'):
-            return Response({'error': 'longitude hors plage.'}, status=400)
-        request.user.last_latitude = latitude
-        request.user.last_longitude = longitude
-        request.user.last_location_at = timezone.now()
-        request.user.save(update_fields=['last_latitude', 'last_longitude', 'last_location_at', 'updated_at'])
-        log_action(request.user, 'UPDATE_LOCATION', 'user', request.user.id)
-        broadcast_event(
-            'livreur.location',
-            {
-                'livreur_id': request.user.id,
-                'latitude': float(latitude),
-                'longitude': float(longitude),
-                'timestamp': request.user.last_location_at.isoformat(),
-            },
-            livreur_id=request.user.id,
-        )
-        return Response({'detail': 'Position mise à jour.'})
+    def change_password(self, request):
+        serializer = ChangePasswordSerializer(data=request.data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        user = request.user
+        user.set_password(serializer.validated_data['new_password'])
+        user.save()
+        log_action(request.user, 'CHANGE_PASSWORD', 'user', user.id)
+        return Response({'message': 'Mot de passe changé avec succès.'})
 
-    @action(detail=False, methods=['get'])
-    def livreurs_positions(self, request):
-        livreurs = self.get_queryset().filter(role='livreur').exclude(
-            last_latitude__isnull=True, last_longitude__isnull=True
-        )
-        data = [
-            {
-                'id': u.id,
-                'nom': u.nom,
-                'latitude': float(u.last_latitude),
-                'longitude': float(u.last_longitude),
-                'last_location_at': u.last_location_at,
-            }
-            for u in livreurs
-        ]
-        return Response(data)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -294,7 +320,7 @@ class EntrepriseViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         ent = serializer.save()
         # Keep global admins global. Only scoped admins auto-gain access on newly created companies.
-        if get_admin_scope_ids(self.request.user):
+        if get_admin_scope_ids(self.request.user) is not None:
             EntrepriseAccess.objects.get_or_create(user=self.request.user, entreprise=ent)
         invalidate_dashboard_cache()
         log_action(self.request.user, 'CREATE_ENTREPRISE', 'entreprise', ent.id, {'nom': ent.nom})
@@ -306,9 +332,15 @@ class EntrepriseViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance):
         ent_id = instance.id
-        log_action(self.request.user, 'DELETE_ENTREPRISE', 'entreprise', instance.id)
-        instance.delete()
+        ent_nom = instance.nom
+        try:
+            instance.delete()
+        except ProtectedError:
+            raise ValidationError({
+                'detail': "Impossible de supprimer cette entreprise car elle contient des transactions financieres."
+            })
         invalidate_dashboard_cache()
+        log_action(self.request.user, 'DELETE_ENTREPRISE', 'entreprise', ent_id, {'nom': ent_nom})
         broadcast_event(
             'entreprise.deleted',
             {'id': ent_id},
@@ -320,35 +352,34 @@ class EntrepriseViewSet(viewsets.ModelViewSet):
         periode = request.query_params.get('periode', 'mois')
         today = date.today()
         date_debut = get_period_start(periode, today)
-        cache_key = f"ent_dash:{request.user.id}:{ent.id}:{periode}"
+        cache_version = get_dashboard_cache_version()
+        cache_key = f"ent_dash:v{cache_version}:{request.user.id}:{ent.id}:{periode}"
         cached = cache.get(cache_key)
         if cached:
             return Response(cached)
 
         stats = ent.get_stats()
-        cmds_qs = Commande.objects.filter(entreprise=ent)
         txns_qs = Transaction.objects.filter(entreprise=ent)
         if date_debut:
-            cmds_qs = cmds_qs.filter(date__gte=date_debut)
             txns_qs = txns_qs.filter(date__gte=date_debut)
 
-        cmds = cmds_qs.order_by('-created_at')[:10]
         rev_par_jour = (
             txns_qs.filter(type='revenu')
-            .annotate(jour=TruncDate('date'))
-            .values('jour')
+            .values('date')
             .annotate(total=Sum('montant'))
-            .order_by('jour')
+            .order_by('date')
         )
         dep_par_jour = (
             txns_qs.filter(type='depense')
-            .annotate(jour=TruncDate('date'))
-            .values('jour')
+            .values('date')
             .annotate(total=Sum('montant'))
-            .order_by('jour')
+            .order_by('date')
         )
-        cmd_par_statut = list(
-            cmds_qs.values('statut').annotate(total=Count('id')).order_by('statut')
+        rev_par_categorie = list(
+            txns_qs.filter(type='revenu').values('categorie').annotate(total=Sum('montant')).order_by('categorie')
+        )
+        dep_par_categorie = list(
+            txns_qs.filter(type='depense').values('categorie').annotate(total=Sum('montant')).order_by('categorie')
         )
         total_revenus = txns_qs.filter(type='revenu').aggregate(t=Sum('montant'))['t'] or Decimal('0')
         total_depenses = txns_qs.filter(type='depense').aggregate(t=Sum('montant'))['t'] or Decimal('0')
@@ -361,150 +392,19 @@ class EntrepriseViewSet(viewsets.ModelViewSet):
                 'depenses': total_depenses,
                 'benefice': total_revenus - total_depenses,
             },
-            'commandes_recentes': CommandeSerializer(cmds, many=True).data,
-            'revenus_par_jour': [{'date': str(r['jour']), 'total': float(r['total'])} for r in rev_par_jour],
-            'depenses_par_jour': [{'date': str(d['jour']), 'total': float(d['total'])} for d in dep_par_jour],
-            'commandes_par_statut': cmd_par_statut,
+            'revenus_par_jour': [{'date': str(r['date']), 'total': float(r['total'])} for r in rev_par_jour],
+            'depenses_par_jour': [{'date': str(d['date']), 'total': float(d['total'])} for d in dep_par_jour],
+            'revenus_par_categorie': rev_par_categorie,
+            'depenses_par_categorie': dep_par_categorie,
+            'transactions_recentes': TransactionSerializer(
+                txns_qs.order_by('-date', '-created_at')[:10],
+                many=True,
+            ).data,
             'alerts_budget': compute_budget_alerts(request.user),
         }
         cache.set(cache_key, payload, DASHBOARD_CACHE_TTL)
         return Response(payload)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# COMMANDE
-# ─────────────────────────────────────────────────────────────────────────────
-
-class CommandeViewSet(viewsets.ModelViewSet):
-    queryset = Commande.objects.select_related('entreprise', 'livreur').all()
-    filterset_fields = ['statut', 'entreprise', 'livreur']
-    search_fields = ['client_nom', 'adresse', 'telephone']
-    ordering_fields = ['date', 'created_at', 'prix']
-
-    def get_permissions(self):
-        if self.action in ('list', 'retrieve'):
-            return [IsAuthenticated(), IsAdminOrLivreur()]
-        if self.action in ('update', 'partial_update', 'demarrer', 'livrer', 'payer') and self.request.user.role == 'livreur':
-            return [IsAuthenticated(), IsOwnerOrAdmin()]
-        return [IsAuthenticated(), IsAdmin()]
-
-    def get_serializer_class(self):
-        if self.action == 'create':
-            return CommandeCreateSerializer
-        return CommandeSerializer
-
-    def get_queryset(self):
-        qs = super().get_queryset()
-        user = self.request.user
-        # Livreur ne voit que ses commandes
-        if user.role == 'livreur':
-            qs = qs.filter(livreur=user)
-        if user.role == 'admin':
-            qs = apply_admin_scope(qs, user)
-        # Filtres date
-        date_debut = self.request.query_params.get('date_debut')
-        date_fin   = self.request.query_params.get('date_fin')
-        if date_debut:
-            qs = qs.filter(date__gte=date_debut)
-        if date_fin:
-            qs = qs.filter(date__lte=date_fin)
-        return qs
-
-    def perform_create(self, serializer):
-        cmd = serializer.save()
-        invalidate_dashboard_cache()
-        log_action(self.request.user, 'CREATE_COMMANDE', 'commande', cmd.id)
-        broadcast_event(
-            'commande.created',
-            {
-                'id': cmd.id,
-                'statut': cmd.statut,
-                'entreprise_id': cmd.entreprise_id,
-                'livreur_id': cmd.livreur_id,
-            },
-            entreprise_id=cmd.entreprise_id,
-            livreur_id=cmd.livreur_id,
-        )
-
-    def perform_update(self, serializer):
-        cmd = serializer.save()
-        invalidate_dashboard_cache()
-        log_action(self.request.user, 'UPDATE_COMMANDE', 'commande', cmd.id)
-        broadcast_event(
-            'commande.updated',
-            {'id': cmd.id, 'statut': cmd.statut},
-            entreprise_id=cmd.entreprise_id,
-            livreur_id=cmd.livreur_id,
-        )
-
-    def perform_destroy(self, instance):
-        cmd_id = instance.id
-        ent_id = instance.entreprise_id
-        liv_id = instance.livreur_id
-        log_action(self.request.user, 'DELETE_COMMANDE', 'commande', cmd_id)
-        instance.delete()
-        invalidate_dashboard_cache()
-        broadcast_event(
-            'commande.deleted',
-            {'id': cmd_id},
-            entreprise_id=ent_id,
-            livreur_id=liv_id,
-        )
-
-    @action(detail=True, methods=['post'])
-    def demarrer(self, request, pk=None):
-        """Livreur démarre la livraison."""
-        cmd = self.get_object()
-        if cmd.statut != 'en attente':
-            return Response({'error': 'La commande doit être en attente.'}, status=400)
-        cmd.statut = 'en cours'
-        cmd.date_demarrage = timezone.now()
-        cmd.save()
-        invalidate_dashboard_cache()
-        log_action(request.user, 'DEMARRER_LIVRAISON', 'commande', cmd.id)
-        broadcast_event(
-            'commande.updated',
-            {'id': cmd.id, 'statut': cmd.statut},
-            entreprise_id=cmd.entreprise_id,
-            livreur_id=cmd.livreur_id,
-        )
-        return Response(CommandeSerializer(cmd).data)
-
-    @action(detail=True, methods=['post'])
-    def livrer(self, request, pk=None):
-        """Livreur marque comme livrée."""
-        cmd = self.get_object()
-        if cmd.statut != 'en cours':
-            return Response({'error': 'La commande doit être en cours.'}, status=400)
-        cmd.statut = 'livrée'
-        cmd.save()
-        invalidate_dashboard_cache()
-        log_action(request.user, 'LIVRAISON_EFFECTUEE', 'commande', cmd.id)
-        broadcast_event(
-            'commande.updated',
-            {'id': cmd.id, 'statut': cmd.statut, 'date_livraison': cmd.date_livraison.isoformat() if cmd.date_livraison else None},
-            entreprise_id=cmd.entreprise_id,
-            livreur_id=cmd.livreur_id,
-        )
-        return Response(CommandeSerializer(cmd).data)
-
-    @action(detail=True, methods=['post'])
-    def payer(self, request, pk=None):
-        """Livreur enregistre le paiement reçu."""
-        cmd = self.get_object()
-        if cmd.statut != 'livrée':
-            return Response({'error': 'La commande doit être livrée avant de recevoir le paiement.'}, status=400)
-        cmd.statut = 'payée'
-        cmd.save()  # Déclenche _create_transactions()
-        invalidate_dashboard_cache()
-        log_action(request.user, 'PAIEMENT_RECU', 'commande', cmd.id, {'montant': str(cmd.prix)})
-        broadcast_event(
-            'commande.updated',
-            {'id': cmd.id, 'statut': cmd.statut, 'date_paiement': cmd.date_paiement.isoformat() if cmd.date_paiement else None},
-            entreprise_id=cmd.entreprise_id,
-            livreur_id=cmd.livreur_id,
-        )
-        return Response(CommandeSerializer(cmd).data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -512,23 +412,27 @@ class CommandeViewSet(viewsets.ModelViewSet):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TransactionViewSet(viewsets.ModelViewSet):
-    queryset = Transaction.objects.select_related('entreprise', 'user', 'commande').all()
+    queryset = Transaction.objects.select_related('entreprise', 'user').all()
     permission_classes = [IsAuthenticated, IsAdmin]
-    filterset_fields = ['type', 'entreprise']
-    search_fields = ['label']
+    filterset_fields = ['type', 'categorie', 'entreprise']
+    search_fields = ['label', 'description']
     ordering_fields = ['date', 'montant']
-
-    def get_permissions(self):
-        if self.action == 'my_history':
-            return [IsAuthenticated(), IsLivreur()]
-        if self.action in ('ajouter_revenu', 'ajouter_depense'):
-            return [IsAuthenticated(), IsAdmin()]
-        return [IsAuthenticated(), IsAdmin()]
 
     def get_serializer_class(self):
         if self.action == 'create':
             return TransactionCreateSerializer
         return TransactionSerializer
+
+    def _ensure_entreprise_in_scope(self, entreprise_id):
+        scope_ids = get_admin_scope_ids(self.request.user)
+        if scope_ids is None:
+            return
+        try:
+            ent_id = int(entreprise_id)
+        except (TypeError, ValueError):
+            raise PermissionDenied("Entreprise invalide.")
+        if ent_id not in scope_ids:
+            raise PermissionDenied("Entreprise hors périmètre autorisé.")
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -542,7 +446,8 @@ class TransactionViewSet(viewsets.ModelViewSet):
         return qs
 
     def perform_create(self, serializer):
-        txn = serializer.save()
+        self._ensure_entreprise_in_scope(serializer.validated_data.get('entreprise').id)
+        txn = serializer.save(user=serializer.validated_data.get('user') or self.request.user)
         invalidate_dashboard_cache()
         log_action(self.request.user, 'CREATE_TRANSACTION', 'transaction', txn.id)
         broadcast_event(
@@ -554,19 +459,24 @@ class TransactionViewSet(viewsets.ModelViewSet):
                 'entreprise_id': txn.entreprise_id,
             },
             entreprise_id=txn.entreprise_id,
-            livreur_id=txn.user_id,
         )
+        notify_budget_exceeded(txn)
 
     def _create_manual_transaction(self, request, tx_type):
         payload = request.data.copy()
         payload['type'] = tx_type
         scope_ids = get_admin_scope_ids(request.user)
         ent_id = payload.get('entreprise')
-        if scope_ids and ent_id and int(ent_id) not in scope_ids:
-            return Response({'error': "Entreprise hors périmètre autorisé."}, status=403)
+        if scope_ids is not None:
+            try:
+                ent_id = int(ent_id)
+            except (TypeError, ValueError):
+                return Response({'error': 'Entreprise invalide.'}, status=400)
+            if ent_id not in scope_ids:
+                return Response({'error': "Entreprise hors périmètre autorisé."}, status=403)
         serializer = TransactionCreateSerializer(data=payload)
         serializer.is_valid(raise_exception=True)
-        txn = serializer.save()
+        txn = serializer.save(user=serializer.validated_data.get('user') or request.user)
         invalidate_dashboard_cache()
         log_action(
             request.user,
@@ -584,8 +494,8 @@ class TransactionViewSet(viewsets.ModelViewSet):
                 'entreprise_id': txn.entreprise_id,
             },
             entreprise_id=txn.entreprise_id,
-            livreur_id=txn.user_id,
         )
+        notify_budget_exceeded(txn)
         return Response(TransactionSerializer(txn).data, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=['post'], url_path='ajouter-revenu')
@@ -595,23 +505,6 @@ class TransactionViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['post'], url_path='ajouter-depense')
     def ajouter_depense(self, request):
         return self._create_manual_transaction(request, 'depense')
-
-    @action(detail=False, methods=['get'], url_path='my-history')
-    def my_history(self, request):
-        qs = Transaction.objects.select_related('entreprise', 'user', 'commande').filter(
-            Q(user=request.user) | Q(commande__livreur=request.user)
-        ).distinct().order_by('-date', '-created_at')
-        tx_type = request.query_params.get('type')
-        if tx_type in ('revenu', 'depense'):
-            qs = qs.filter(type=tx_type)
-        date_debut = request.query_params.get('date_debut')
-        date_fin = request.query_params.get('date_fin')
-        if date_debut:
-            qs = qs.filter(date__gte=date_debut)
-        if date_fin:
-            qs = qs.filter(date__lte=date_fin)
-        return Response(TransactionSerializer(qs, many=True).data)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OBJECTIF
@@ -657,8 +550,9 @@ class DashboardView(APIView):
     def get(self, request):
         periode = request.query_params.get('periode', 'mois')  # jour, semaine, mois, annee
         scope_ids = get_admin_scope_ids(request.user)
-        scope_part = ','.join(str(i) for i in sorted(scope_ids)) if scope_ids else 'all'
-        cache_key = f"global_dash:{request.user.id}:{periode}:{scope_part}"
+        scope_part = 'global' if scope_ids is None else ','.join(str(i) for i in sorted(scope_ids)) or 'none'
+        cache_version = get_dashboard_cache_version()
+        cache_key = f"global_dash:v{cache_version}:{request.user.id}:{periode}:{scope_part}"
         cached = cache.get(cache_key)
         if cached:
             return Response(cached)
@@ -669,11 +563,13 @@ class DashboardView(APIView):
         txns = apply_admin_scope(Transaction.objects.filter(date__gte=date_debut), request.user)
         revenus  = txns.filter(type='revenu').aggregate(t=Sum('montant'))['t'] or Decimal('0')
         depenses = txns.filter(type='depense').aggregate(t=Sum('montant'))['t'] or Decimal('0')
-
-        # Commandes
-        cmds = apply_admin_scope(Commande.objects.all(), request.user)
-        nb_statuts = cmds.values('statut').annotate(n=Count('id'))
-        statut_map = {s['statut']: s['n'] for s in nb_statuts}
+        benefice = revenus - depenses
+        nb_revenus = txns.filter(type='revenu').count()
+        nb_depenses = txns.filter(type='depense').count()
+        nb_transactions = nb_revenus + nb_depenses
+        marge_nette = (benefice / revenus * 100) if revenus else Decimal('0')
+        revenu_moyen = (revenus / nb_revenus) if nb_revenus else Decimal('0')
+        depense_moyenne = (depenses / nb_depenses) if nb_depenses else Decimal('0')
 
         # Revenu par jour (30 derniers jours)
         rev_par_jour = (
@@ -681,36 +577,61 @@ class DashboardView(APIView):
                 Transaction.objects.filter(type='revenu', date__gte=today - timedelta(days=30)),
                 request.user,
             )
-            .annotate(jour=TruncDate('date'))
-            .values('jour')
+            .values('date')
             .annotate(total=Sum('montant'))
-            .order_by('jour')
+            .order_by('date')
         )
         dep_par_jour = (
             apply_admin_scope(
                 Transaction.objects.filter(type='depense', date__gte=today - timedelta(days=30)),
                 request.user,
             )
-            .annotate(jour=TruncDate('date'))
-            .values('jour')
+            .values('date')
             .annotate(total=Sum('montant'))
-            .order_by('jour')
+            .order_by('date')
         )
 
-        # Stats par entreprise
+        revenus_par_categorie = list(
+            txns.filter(type='revenu')
+            .values('categorie')
+            .annotate(total=Sum('montant'), count=Count('id'))
+            .order_by('-total')
+        )
+        depenses_par_categorie = list(
+            txns.filter(type='depense')
+            .values('categorie')
+            .annotate(total=Sum('montant'), count=Count('id'))
+            .order_by('-total')
+        )
+
+        transactions_par_entreprise = list(
+            txns.values('entreprise__id', 'entreprise__nom')
+            .annotate(
+                revenus=Sum('montant', filter=Q(type='revenu')),
+                depenses=Sum('montant', filter=Q(type='depense')),
+                total=Count('id'),
+            )
+            .order_by('-revenus', 'entreprise__nom')
+        )
+
         entreprises_qs = apply_admin_scope(Entreprise.objects.all(), request.user, field='id')
         entreprises_stats = []
         for ent in entreprises_qs:
-            s = ent.get_stats()
+            ent_txns = txns.filter(entreprise=ent)
+            ent_revenus = ent_txns.filter(type='revenu').aggregate(t=Sum('montant'))['t'] or Decimal('0')
+            ent_depenses = ent_txns.filter(type='depense').aggregate(t=Sum('montant'))['t'] or Decimal('0')
             entreprises_stats.append({
                 'id': ent.id, 'nom': ent.nom,
-                'revenus': s['revenus'], 'depenses': s['depenses'],
-                'benefice': s['benefice'], 'nb_commandes': s['nb_commandes'],
+                'revenus': ent_revenus,
+                'depenses': ent_depenses,
+                'benefice': ent_revenus - ent_depenses,
+                'nb_transactions': ent_txns.count(),
             })
 
-        commandes_par_entreprise = list(
-            cmds.values('entreprise__id', 'entreprise__nom').annotate(total=Count('id')).order_by('-total')
-        )
+        transactions_recentes = apply_admin_scope(
+            Transaction.objects.select_related('entreprise', 'user').all(),
+            request.user,
+        ).order_by('-date', '-created_at')[:8]
         objectifs = ObjectifSerializer(
             Objectif.objects.all(),
             many=True,
@@ -720,63 +641,29 @@ class DashboardView(APIView):
             'periode':         periode,
             'revenus_total':   revenus,
             'depenses_total':  depenses,
-            'benefice_net':    revenus - depenses,
-            'nb_commandes':    cmds.count(),
-            'nb_en_attente':   statut_map.get('en attente', 0),
-            'nb_en_cours':     statut_map.get('en cours', 0),
-            'nb_livrees':      statut_map.get('livrée', 0),
-            'nb_payees':       statut_map.get('payée', 0),
+            'benefice_net':    benefice,
+            'marge_nette_percent': round(float(marge_nette), 2),
+            'revenu_moyen': revenu_moyen,
+            'depense_moyenne': depense_moyenne,
+            'nb_transactions': nb_transactions,
+            'nb_revenus': nb_revenus,
+            'nb_depenses': nb_depenses,
             'revenus_par_jour': [
-                {'date': str(r['jour']), 'total': float(r['total'])} for r in rev_par_jour
+                {'date': str(r['date']), 'total': float(r['total'])} for r in rev_par_jour
             ],
             'depenses_par_jour': [
-                {'date': str(d['jour']), 'total': float(d['total'])} for d in dep_par_jour
+                {'date': str(d['date']), 'total': float(d['total'])} for d in dep_par_jour
             ],
             'entreprises_stats': entreprises_stats,
-            'commandes_par_entreprise': commandes_par_entreprise,
+            'transactions_par_entreprise': transactions_par_entreprise,
+            'revenus_par_categorie': revenus_par_categorie,
+            'depenses_par_categorie': depenses_par_categorie,
+            'transactions_recentes': TransactionSerializer(transactions_recentes, many=True).data,
             'objectifs': objectifs,
             'alerts_budget': compute_budget_alerts(request.user),
         }
         cache.set(cache_key, payload, DASHBOARD_CACHE_TTL)
         return Response(payload)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DASHBOARD LIVREUR
-# ─────────────────────────────────────────────────────────────────────────────
-
-class DashboardLivreurView(APIView):
-    permission_classes = [IsAuthenticated, IsLivreur]
-
-    def get(self, request):
-        user = request.user
-        cmds = Commande.objects.filter(livreur=user)
-        revenus_qs = Transaction.objects.filter(type='revenu').filter(
-            Q(user=user) | Q(commande__in=cmds)
-        ).distinct()
-        total_paiements = revenus_qs.aggregate(t=Sum('montant'))['t'] or Decimal('0')
-        revenus_par_jour = (
-            revenus_qs.filter(date__gte=date.today() - timedelta(days=30))
-            .annotate(jour=TruncDate('date'))
-            .values('jour')
-            .annotate(total=Sum('montant'))
-            .order_by('jour')
-        )
-        dernieres_transactions = Transaction.objects.filter(
-            Q(user=user) | Q(commande__livreur=user)
-        ).select_related('entreprise', 'commande').distinct().order_by('-created_at')[:20]
-        return Response({
-            'total_commandes':  cmds.count(),
-            'en_attente':       cmds.filter(statut='en attente').count(),
-            'en_cours':         cmds.filter(statut='en cours').count(),
-            'livrees':          cmds.filter(statut='livrée').count(),
-            'payees':           cmds.filter(statut='payée').count(),
-            'total_paiements':  total_paiements,
-            'revenus_par_jour': [
-                {'date': str(r['jour']), 'total': float(r['total'])} for r in revenus_par_jour
-            ],
-            'historique_transactions': TransactionSerializer(dernieres_transactions, many=True).data,
-        })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -811,31 +698,20 @@ class ExportPDFView(APIView):
         date_debut  = request.data.get('date_debut')
         date_fin    = request.data.get('date_fin')
         entreprise_id = request.data.get('entreprise_id')
-        livreur_id  = request.data.get('livreur_id')
-        type_export = request.data.get('type', 'commandes')  # commandes | transactions | complet
+        type_export = request.data.get('type', 'transactions')
         signature_nom = request.data.get('signature_nom') or request.user.nom
 
-        cmds = apply_admin_scope(
-            Commande.objects.select_related('entreprise', 'livreur').all(),
-            request.user
-        )
         txns = apply_admin_scope(
             Transaction.objects.select_related('entreprise', 'user').all(),
             request.user
         )
 
         if date_debut:
-            cmds = cmds.filter(date__gte=date_debut)
             txns = txns.filter(date__gte=date_debut)
         if date_fin:
-            cmds = cmds.filter(date__lte=date_fin)
             txns = txns.filter(date__lte=date_fin)
         if entreprise_id:
-            cmds = cmds.filter(entreprise_id=entreprise_id)
             txns = txns.filter(entreprise_id=entreprise_id)
-        if livreur_id:
-            cmds = cmds.filter(livreur_id=livreur_id)
-            txns = txns.filter(Q(user_id=livreur_id) | Q(commande__livreur_id=livreur_id))
 
         log_action(
             request.user,
@@ -845,13 +721,12 @@ class ExportPDFView(APIView):
                 'date_debut': date_debut,
                 'date_fin': date_fin,
                 'entreprise_id': entreprise_id,
-                'livreur_id': livreur_id,
             }
         )
 
         from django.http import HttpResponse
         pdf_content = generate_pdf_report(
-            cmds, txns, type_export, date_debut, date_fin, signature_nom=signature_nom
+            txns, type_export, date_debut, date_fin, signature_nom=signature_nom
         )
         response = HttpResponse(pdf_content, content_type='application/pdf')
         response['Content-Disposition'] = f'attachment; filename="DeliverPro_Export_{date_debut}_{date_fin}.pdf"'

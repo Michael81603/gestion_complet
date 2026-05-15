@@ -3,7 +3,7 @@ DeliverPro — Utilitaires : Audit Log + Génération PDF
 """
 from io import BytesIO
 from decimal import Decimal
-from datetime import date
+from datetime import date, datetime
 
 from .models import AuditLog
 
@@ -24,7 +24,7 @@ def log_action(user, action, table_name='', record_id=None, details=None, ip=Non
 
 
 def generate_pdf_report(
-    commandes, transactions, type_export, date_debut=None, date_fin=None, signature_nom="Admin"
+    transactions, type_export='transactions', date_debut=None, date_fin=None, signature_nom="Admin"
 ):
     """
     Génère un rapport PDF avec ReportLab.
@@ -55,16 +55,48 @@ def generate_pdf_report(
     GREEN  = colors.HexColor('#22c55e')
     RED    = colors.HexColor('#ef4444')
 
-    title_style = ParagraphStyle('title', fontSize=22, textColor=ORANGE, fontName='Helvetica-Bold', spaceAfter=4)
-    subtitle_style = ParagraphStyle('subtitle', fontSize=10, textColor=GRAY, spaceAfter=20)
+    title_style = ParagraphStyle(
+        'title',
+        fontSize=22,
+        leading=28,
+        textColor=ORANGE,
+        fontName='Helvetica-Bold',
+        spaceAfter=8,
+    )
+    subtitle_style = ParagraphStyle(
+        'subtitle',
+        fontSize=10,
+        leading=14,
+        textColor=GRAY,
+        spaceAfter=18,
+    )
     section_style = ParagraphStyle('section', fontSize=13, textColor=DARK, fontName='Helvetica-Bold', spaceBefore=16, spaceAfter=8)
     normal_style = ParagraphStyle('normal', fontSize=9, textColor=DARK)
 
     elements = []
 
+    transactions = list(transactions)
+
     # ── En-tête ──────────────────────────────────────────────────────────────
-    elements.append(Paragraph("🚚 DeliverPro — Rapport", title_style))
-    period_str = f"Du {date_debut} au {date_fin}" if date_debut and date_fin else f"Généré le {date.today()}"
+    def format_report_date(value):
+        if not value:
+            return ''
+        if isinstance(value, datetime):
+            parsed = value.date()
+        elif isinstance(value, date):
+            parsed = value
+        else:
+            try:
+                parsed = date.fromisoformat(str(value)[:10])
+            except ValueError:
+                return str(value)
+        return parsed.strftime('%d/%m/%Y')
+
+    elements.append(Paragraph("DeliverPro Finance — Rapport", title_style))
+    if date_debut and date_fin:
+        period_str = f"Période du {format_report_date(date_debut)} au {format_report_date(date_fin)}"
+    else:
+        period_str = f"Généré le {format_report_date(date.today())}"
     elements.append(Paragraph(period_str, subtitle_style))
     elements.append(HRFlowable(width="100%", thickness=2, color=ORANGE, spaceAfter=16))
 
@@ -72,14 +104,16 @@ def generate_pdf_report(
     revenus  = sum((t.montant for t in transactions if t.type == 'revenu'),  Decimal('0'))
     depenses = sum((t.montant for t in transactions if t.type == 'depense'), Decimal('0'))
     benefice = revenus - depenses
+    marge = (benefice / revenus * 100) if revenus else Decimal('0')
 
     elements.append(Paragraph("RÉSUMÉ FINANCIER", section_style))
     summary_data = [
         ["Indicateur",        "Valeur"],
-        ["💰 Revenus totaux",  f"{revenus:.2f} €"],
-        ["💸 Dépenses totales", f"{depenses:.2f} €"],
-        ["📈 Bénéfice net",    f"{benefice:.2f} €"],
-        ["📦 Nb. commandes",   str(commandes.count())],
+        ["Revenus totaux",  f"{revenus:.2f} MGA"],
+        ["Dépenses totales", f"{depenses:.2f} MGA"],
+        ["Bénéfice net",    f"{benefice:.2f} MGA"],
+        ["Marge nette",        f"{marge:.2f} %"],
+        ["Nb. transactions",   str(len(transactions))],
     ]
     summary_table = Table(summary_data, colWidths=[10*cm, 6*cm])
     summary_table.setStyle(TableStyle([
@@ -96,54 +130,23 @@ def generate_pdf_report(
     elements.append(summary_table)
     elements.append(Spacer(1, 0.5*cm))
 
-    # ── Commandes ─────────────────────────────────────────────────────────────
-    if type_export in ('commandes', 'complet'):
-        elements.append(Paragraph("LISTE DES COMMANDES", section_style))
-        cmd_data = [["#", "Client", "Entreprise", "Livreur", "Prix", "Coût Liv.", "Statut", "Date"]]
-        for c in commandes:
-            ent_nom = c.entreprise.nom if c.entreprise else '-'
-            liv_nom = c.livreur.nom   if c.livreur   else 'Non assigné'
-            cmd_data.append([
-                str(c.id),
-                c.client_nom[:20],
-                ent_nom[:18],
-                liv_nom[:15],
-                f"{c.prix:.2f} €",
-                f"{c.cout_livraison:.2f} €",
-                c.statut,
-                str(c.date),
-            ])
-
-        cmd_table = Table(cmd_data, colWidths=[1*cm, 3.5*cm, 3.5*cm, 2.8*cm, 2*cm, 2*cm, 2*cm, 2.2*cm])
-        cmd_table.setStyle(TableStyle([
-            ('BACKGROUND',   (0, 0), (-1, 0),  ORANGE),
-            ('TEXTCOLOR',    (0, 0), (-1, 0),  colors.white),
-            ('FONTNAME',     (0, 0), (-1, 0),  'Helvetica-Bold'),
-            ('FONTSIZE',     (0, 0), (-1, -1), 7.5),
-            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.HexColor('#f8fafc'), colors.white]),
-            ('GRID',         (0, 0), (-1, -1), 0.3, colors.HexColor('#e2e8f0')),
-            ('PADDING',      (0, 0), (-1, -1), 5),
-            ('ALIGN',        (4, 1), (5, -1), 'RIGHT'),
-        ]))
-        elements.append(cmd_table)
-        elements.append(Spacer(1, 0.4*cm))
-
     # ── Transactions ──────────────────────────────────────────────────────────
-    if type_export in ('transactions', 'complet'):
+    if type_export in ('transactions', 'complet', 'finance'):
         elements.append(Paragraph("JOURNAL DES TRANSACTIONS", section_style))
-        txn_data = [["#", "Type", "Libellé", "Entreprise", "Montant", "Date"]]
+        txn_data = [["#", "Type", "Catégorie", "Libellé", "Entreprise", "Montant", "Date"]]
         for t in transactions:
             ent_nom = t.entreprise.nom if t.entreprise else 'Général'
             txn_data.append([
                 str(t.id),
                 t.type.capitalize(),
-                t.label[:35],
-                ent_nom[:20],
-                f"{'+' if t.type == 'revenu' else '-'}{t.montant:.2f} €",
-                str(t.date),
+                t.categorie[:16],
+                t.label[:28],
+                ent_nom[:18],
+                f"{'+' if t.type == 'revenu' else '-'}{t.montant:.2f} MGA",
+                format_report_date(t.date),
             ])
 
-        txn_table = Table(txn_data, colWidths=[1*cm, 2*cm, 6*cm, 3.5*cm, 2.5*cm, 2*cm])
+        txn_table = Table(txn_data, colWidths=[1*cm, 2*cm, 2.5*cm, 4.2*cm, 3*cm, 2.8*cm, 2.3*cm])
         txn_table.setStyle(TableStyle([
             ('BACKGROUND',   (0, 0), (-1, 0),  ORANGE),
             ('TEXTCOLOR',    (0, 0), (-1, 0),  colors.white),
